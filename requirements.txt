@@ -1,19 +1,27 @@
+# Python 3.10 required (3.12 incompatible with degan/TensorFlow)
 ultralytics>=8.3.0
 opencv-python
 torch
 torchvision
 numpy
 tqdm
-pyzbar
-paddleocr>=2.9.1
+paddleocr>=3.0.0
+# PaddleX OCR pipeline (paddlex[ocr-core])
+shapely
+pyclipper
+python-bidi
+pypdfium2>=4
+imagesize
 pyzbar==0.1.9
 opencv-contrib-python-headless==4.10.0.84
-python-dateutil 
+python-dateutil
 rapidfuzz
 pydantic==2.*
 langchain-text-splitters
 imagehash
 paddlepaddle
-scikit-learn 
-scipy 
-pandas 
+scikit-learn
+scipy
+pandas
+# DE-GAN deblur (TensorFlow; Python >=3.9,<3.12)
+degan @ https://github.com/00sapo/degan/releases/download/v0.1.1/degan-0.1.1-py3-none-any.whl

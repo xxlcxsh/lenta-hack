@@ -52,7 +52,10 @@ except ImportError:
 try:
     from paddleocr import PaddleOCR
 except ImportError:
-    sys.exit("❌ Установите: pip install paddleocr>=2.9.1 paddlepaddle")
+    sys.exit(
+        "❌ Установите: pip install -r requirements.txt  "
+        "(paddleocr>=3.0, paddlepaddle, langchain-text-splitters, shapely, pyclipper)"
+    )
 
 try:
     import pyzbar.pyzbar as pyzbar
@@ -309,6 +312,38 @@ class ZoneSegmentor:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DE-GAN deblur (опционально, один раз на кроп ценника)
+# ═══════════════════════════════════════════════════════════════════════════
+
+try:
+    from degan import DEGAN as _DEGAN
+
+    _DEGAN_OK = True
+except ImportError:
+    _DEGAN = None  # type: ignore
+    _DEGAN_OK = False
+
+
+class DeganEnhancer:
+    """Обёртка над degan: только deblur, BGR in/out."""
+
+    def __init__(self):
+        if not _DEGAN_OK:
+            raise RuntimeError(
+                "degan не установлен. Python 3.10: pip install -r requirements.txt"
+            )
+        log.info("🧹 Загрузка DE-GAN (deblur)…")
+        self._model = _DEGAN(bin_weights=None, wat_weights=None)
+        log.info("✅ DE-GAN готов")
+
+    def deblur_bgr(self, bgr: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        out = self._model.deblur(gray)
+        out_u8 = (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
+        return cv2.cvtColor(out_u8, cv2.COLOR_GRAY2BGR)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # OCR-МОДУЛЬ (работает на numpy-массивах, без записи на диск)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -320,14 +355,20 @@ class OCRModule:
       3. pyzbar / WechatQR на zone_barcode / zone_qr_code
     """
 
-    def __init__(self, zone_segmentor: ZoneSegmentor):
+    def __init__(self, zone_segmentor: ZoneSegmentor, zone_upscale: bool = True):
         self.segmentor = zone_segmentor
-        log.info("🔤 Инициализация PaddleOCR…")
+        self._zone_upscale = zone_upscale
+        log.info("🔤 Инициализация PaddleOCR (PP-OCRv5, ru+en)…")
+        # lang=ru + PP-OCRv5 → eslav_PP-OCRv5_mobile_rec (русский + английский + укр./бел.).
+        # use_sr/ESRGAN в PaddleOCR 3.x нет (Unknown argument) — апскейл в _upscale_zone().
         self._ocr = PaddleOCR(
-                                lang="ru",
-                                enable_mkldnn=False,
-                                use_angle_cls=False,
-                            )
+            lang="ru",
+            ocr_version="PP-OCRv5",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=True,
+            enable_mkldnn=False,
+        )
         # WechatQR
         if _WECHAT_OK:
             try:
@@ -338,11 +379,26 @@ class OCRModule:
             self._wechat = None
         log.info("✅ OCR готов")
 
-    # ── предобработка зоны перед OCR ──────────────────────────────────────
+    # ── апскейл мелких зон (замена use_sr/ESRGAN, недоступных в PaddleOCR 3.x) ─
+
+    @staticmethod
+    def _upscale_zone(bgr: np.ndarray, min_side: int = 128, scale_cap: float = 4.0) -> np.ndarray:
+        """LANCZOS4-апскейл мелких кропов перед OCR (аналог SR для ценников)."""
+        h, w = bgr.shape[:2]
+        if h >= min_side and w >= min_side:
+            return bgr
+        scale = min(scale_cap, max(min_side / h, min_side / w))
+        return cv2.resize(
+            bgr,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+
+    # ── предобработка зоны (не используется: бинаризация конфликтует с PP-OCRv5) ─
 
     @staticmethod
     def _preprocess_zone(bgr: np.ndarray) -> np.ndarray:
-        """Резкость + адаптивный порог. Возвращает BGR для PaddleOCR."""
+        """Резкость + адаптивный порог. Не вызывается — оставлено для экспериментов."""
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
         sharp = cv2.filter2D(gray, -1, kernel)
@@ -366,16 +422,8 @@ class OCRModule:
 
     def _ocr_zone(self, zone_bgr: np.ndarray) -> List[str]:
         try:
-            h, w = zone_bgr.shape[:2]
-
-            if h < 128 or w < 128:
-                scale = max(128 / h, 128 / w)
-
-                zone_bgr = cv2.resize(
-                    zone_bgr,
-                    (int(w * scale), int(h * scale)),
-                    interpolation=cv2.INTER_CUBIC
-                )
+            if self._zone_upscale:
+                zone_bgr = self._upscale_zone(zone_bgr)
 
             cv2.imwrite("debug_ocr_input.jpg", zone_bgr)
 
@@ -622,6 +670,8 @@ class PriceTagPipeline:
         hash_threshold: int = 10,
         product_db: Optional[ProductDB] = None,
         save_crops: bool = True,
+        use_degan: bool = False,
+        zone_upscale: bool = True,
     ):
         base = Path(__file__).resolve().parent
         self.model = YOLO(
@@ -643,6 +693,11 @@ class PriceTagPipeline:
         self.hash_threshold = hash_threshold
         self.save_crops = save_crops
         self.product_db = product_db
+        self.use_degan = use_degan
+        self.zone_upscale = zone_upscale
+        self.degan: Optional[DeganEnhancer] = None
+        if use_degan:
+            self.degan = DeganEnhancer()
 
         # Параметры дисторсии
         self.camera_matrix = None
@@ -659,6 +714,7 @@ class PriceTagPipeline:
         (self.output_dir / "best_crops").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "filtered_crops").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "debug_videos").mkdir(parents=True, exist_ok=True)
+        Path(DEBUG_DIR).mkdir(parents=True, exist_ok=True)
 
         self.tracker_yaml_path = self._create_custom_tracker()
 
@@ -669,7 +725,7 @@ class PriceTagPipeline:
             else base / price_model_path
         )
         zone_segmentor = ZoneSegmentor(price_model_full, conf=zone_conf)
-        self.ocr = OCRModule(zone_segmentor)
+        self.ocr = OCRModule(zone_segmentor, zone_upscale=zone_upscale)
 
     # ── настройка трекера ──────────────────────────────────────────────────
 
@@ -958,6 +1014,12 @@ class PriceTagPipeline:
                      f"bbox=({x1},{y1},{x2},{y2})")
             try:
                 rotated_crop = cv2.rotate(best_det['crop'], cv2.ROTATE_90_COUNTERCLOCKWISE)
+                if self.degan is not None:
+                    rotated_crop = self.degan.deblur_bgr(rotated_crop)
+                    cv2.imwrite(
+                        str(Path(DEBUG_DIR) / f"{base_name}_degan.jpg"),
+                        rotated_crop,
+                    )
                 ocr_fields = self.ocr.recognize(rotated_crop)
 
             except Exception as e:
@@ -1051,6 +1113,10 @@ def main():
                         help="Строгость pHash-дедупликации (0-64)")
     parser.add_argument("--no-save-crops", action="store_true",
                         help="Не сохранять кропы на диск (только CSV)")
+    parser.add_argument("--use-degan", action="store_true",
+                        help="DE-GAN deblur кропа ценника один раз перед YOLO_PRICE/OCR")
+    parser.add_argument("--no-zone-upscale", action="store_true",
+                        help="Отключить LANCZOS-апскейл мелких zone-кропов перед OCR")
 
     # База товаров
     parser.add_argument(
@@ -1107,6 +1173,13 @@ def main():
             min_score=args.db_min_score,
         )
 
+    if args.use_degan and not _DEGAN_OK:
+        log.error(
+            "❌ --use-degan: пакет degan недоступен. "
+            "Используйте Python 3.10 и pip install -r requirements.txt"
+        )
+        sys.exit(1)
+
     PriceTagPipeline(
         model_path=args.cropper_model,
         price_model_path=args.price_model,
@@ -1125,6 +1198,8 @@ def main():
         hash_threshold=args.hash_threshold,
         product_db=product_db,
         save_crops=not args.no_save_crops,
+        use_degan=args.use_degan,
+        zone_upscale=not args.no_zone_upscale,
     ).run()
 
 
